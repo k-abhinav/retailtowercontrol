@@ -1,0 +1,61 @@
+⚡ Execution & Comms Agent — Full Responsibility Breakdown
+
+1. Workflow Reconfiguration
+When the business objective changes (e.g., clearance mode), it's this agent that physically swaps the active workflow — not the Decision agent. It:
+
+Saves the current workflow config to the rollback registry (Cosmos DB) before touching anything
+Atomically updates the feature flag in Azure App Configuration to point to the new workflow variant
+Activates or deactivates integration connectors (e.g., turns on the promo-pricing-sync connector, turns off the standard replenishment connector)
+
+If the Decision agent decides what to do, the Execution agent decides how to wire things up to make it happen.
+
+2. Rollback & Recovery
+This is the safety escape hatch for the whole system. When something goes wrong:
+
+Detects anomalies via Azure Monitor alerts (e.g., PO creation rate spikes to 847/hr)
+Triggers the circuit breaker signal (sets a flag in App Configuration that Polly picks up in the Decision agent)
+Loads the last stable workflow version from the rollback registry
+Flips the feature flag back — entire rollback in under 2 minutes, no redeployment
+Writes the incident timeline to Azure Monitor for post-mortem
+
+Without this agent, there's no autonomous recovery path.
+
+3. Inter-Store Inventory Reallocation
+In Scenario 1 and Scenario 3, once the Decision agent calculates the reallocation plan (which stores have surplus, which are critical), it hands the execution of that plan to this agent:
+
+Calls the WMS Transfer Order API for each store-to-store movement
+Sequences the calls correctly (you can't initiate a transfer from a store that's already being transferred to)
+Handles partial failures — if 2 of 12 WMS calls fail, it retries those 2 without re-running all 12
+Updates the expected inbound schedule in ERP so stock-in-transit is visible to the Sensing agent
+
+This is real operational work, not messaging.
+
+4. Supplier & Connector Activation
+When a disruption happens (Scenario 3), this agent:
+
+Activates the emergency-3PL connector (pre-configured but dormant) so expedited freight routing becomes available
+Updates the WMS inbound receipt schedule to reflect the new supplier's lead time
+Calls the EDI acknowledgement back to the supplier confirming the PO was received
+
+It's the only agent with write access to the integration connector registry.
+
+5. Notifications & Human-in-the-Loop
+This is the "comms" part — but it's more nuanced than just sending a message:
+
+Routine notifications: Daily sell-through digest, clearance activation summary, PO batch summary
+Approval cards: When Decision agent creates a PO over the approval threshold ($80K), Execution sends a Teams Adaptive Card with the full reasoning trace attached — the buyer sees why the agent made the decision, not just what it did
+P1 Incident alerts: Within 60 seconds of a supplier delay EDI arriving, on-call buyer + supply chain manager get a Teams + SMS notification with store-level impact map
+Escalation routing: If a circuit breaker stays open for >10 minutes, it escalates up the chain automatically
+
+
+6. Audit Logging
+Every action taken by any agent is logged here — not as an afterthought but as a structured AgentDecisionEvent:
+correlation_id, scenario_type, agent_name, 
+action_taken, inputs_summary, confidence_score, 
+duration_ms, outcome, timestamp
+This goes to Azure Monitor Logs (immutable) and is the source of truth for compliance audits, post-incident reviews, and any "why did the system do that?" question from a buyer.
+
+Summary — The 3 things that make it non-trivial
+MisconceptionReality"It just sends emails"It physically reconfigures live integration connectors and workflows"It's passive"It's the first agent to respond in Scenario 3 (receives the EDI 824)"It can be skipped for MVP"Without it there is no rollback, no reallocation, no connector management
+
+The short version: Decision agent decides, Execution agent makes it real and keeps it safe.
